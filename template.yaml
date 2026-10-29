@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 学習ログアプリ全体 (S3 + CloudFront + HTTP API + Lambda x2 + DynamoDB + CloudWatchアラーム)
+
+Parameters:
+  AlarmEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: メールアドレスの形式で入力してください
+    Description: Lambdaのエラー通知を受け取るメールアドレス
+
+Resources:
+  # ---------- DynamoDB ----------
+  StudyLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+
+  # ---------- IAMロール(機能ごとに権限を分ける) ----------
+  CreateFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: put-study-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt StudyLogsTable.Arn
+
+  GetFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: query-study-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt StudyLogsTable.Arn
+
+  # ---------- Lambda ----------
+  CreateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref StudyLogsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+
+          import boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+
+          def response(status, body):
+              return {
+                  "statusCode": status,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps(body, ensure_ascii=False),
+              }
+
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get("body") or "{}")
+              except json.JSONDecodeError:
+                  return response(400, {"message": "JSONの形式が正しくありません"})
+
+              name = str(body.get("name", "")).strip()
+              content = str(body.get("content", "")).strip()
+
+              if not name or not content:
+                  return response(400, {"message": "nameとcontentは必須です"})
+              if len(name) > 30 or len(content) > 500:
+                  return response(400, {"message": "文字数が多すぎます"})
+
+              item = {
+                  "pk": "LOG",
+                  "createdAt": datetime.now(timezone.utc).isoformat(),
+                  "id": str(uuid.uuid4()),
+                  "name": name,
+                  "content": content,
+              }
+              table.put_item(Item=item)
+              return response(201, item)
+
+  GetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt GetFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref StudyLogsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+
+          def lambda_handler(event, context):
+              result = table.query(
+                  KeyConditionExpression=Key("pk").eq("LOG"),
+                  ScanIndexForward=False,  # 新しい順
+                  Limit=50,
+              )
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps(result["Items"], ensure_ascii=False),
+              }
+
+  # ---------- API Gateway (HTTP API) ----------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: study-log-api-iac
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub https://${Distribution.DomainName}
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+
+  HttpStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  CreateIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CreateFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  GetIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  CreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /logs
+      Target: !Sub integrations/${CreateIntegration}
+
+  GetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /logs
+      Target: !Sub integrations/${GetIntegration}
+
+  # API GatewayがLambdaを呼び出すための許可
+  CreatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/POST/logs
+
+  GetPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/GET/logs
+
+  # ---------- フロント: S3 (非公開) + CloudFront ----------
+  FrontBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - Id: s3-origin
+            DomainName: !GetAtt FrontBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          # マネージドポリシー CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+
+  # CloudFrontからだけS3を読めるようにする
+  FrontBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+  # ---------- 監視: Lambdaのエラーをメールで通知 ----------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  CreateErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 投稿用Lambdaでエラーが発生
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  GetErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 取得用Lambdaでエラーが発生
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GetFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  SiteUrl:
+    Description: 公開URL(ブラウザで開く)
+    Value: !Sub https://${Distribution.DomainName}
+  ApiUrl:
+    Description: APIの呼び出しURL(フロントのAPI_URLに使う)
+    Value: !GetAtt HttpApi.ApiEndpoint
+  BucketName:
+    Description: index.htmlをアップロードするバケット
+    Value: !Ref FrontBucket
+  TableName:
+    Description: DynamoDBテーブル名
+    Value: !Ref StudyLogsTable
